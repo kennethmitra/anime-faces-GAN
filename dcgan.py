@@ -55,6 +55,8 @@ progress_pic_freq = 100
 # Discriminator Noise
 noise_disc_std = 0.02
 
+save_file = './iter22900.save'
+
 # Initialize Conv and BatchNorm layers from uniform distribution
 def weights_init(m):
     classname = m.__class__.__name__
@@ -168,6 +170,20 @@ if __name__ == '__main__':
     optimD = torch.optim.Adam(netD.parameters(), lr=lr_d, betas=(beta1, 0.999))
     optimG = torch.optim.Adam(netG.parameters(), lr=lr_g, betas=(beta1, 0.999))
 
+    batch_iters = 0
+    saved_epoch = 0
+    # Load saved model
+    if save_file is not None and save_file != "":
+        save = torch.load(save_file)
+        optimG.load_state_dict(save['optimG_params'])
+        optimD.load_state_dict(save['optimD_params'])
+        netG.load_state_dict(save['gen_params'])
+        netD.load_state_dict(save['disc_params'])
+        saved_epoch = save['epoch']
+        batch_iters = save['batch_iters']
+        print(f"Resuming training from epoch {saved_epoch} and batch_iters {batch_iters}")
+
+
     # Tensorboard for logging
     logger = SummaryWriter()
 
@@ -185,9 +201,9 @@ if __name__ == '__main__':
 
     # ================= Training Loop ================= #
     print("Starting Training...")
-    batch_iters = 0
 
-    for epoch in range(0, num_epochs):
+
+    for epoch in range(saved_epoch, num_epochs):
         for batch_num, batch_data in enumerate(dataloader, 0):
 
             # ----- Update Discriminator ----- #

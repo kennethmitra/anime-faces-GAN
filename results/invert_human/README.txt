@@ -4,6 +4,7 @@ For everything except lpips_alternateAdam and lpips_mse_*
 Adam optimizer, lr=0.1
 Steps: 10000
 
+DCGAN iter48800.save
 
 lpips_alternateAdam*
 ---------------------------

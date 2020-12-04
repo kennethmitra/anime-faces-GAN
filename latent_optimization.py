@@ -19,7 +19,7 @@ class LatentOptim:
         self.z_vec.requires_grad = True
 
         self.params = [self.z_vec]
-        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.99))
+        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.999))
         #self.optim = torch.optim.SGD(self.params, lr=lr, momentum=0.9)
         #self.scheduler = CosineAnnealingWarmRestarts(self.optim, 100, 1)
         #self.scheduler = CyclicLR(self.optim, base_lr=1e-2, max_lr=0.1, step_size_up=500)
@@ -73,6 +73,10 @@ class LatentOptim:
             loss = self.lpips_loss(self.target_image, image)
         elif self.loss_type == 'lpips+mse':
             loss = 0.8 * self.lpips_loss(self.target_image, image) + 0.2 * torch.mean((self.target_image - image)**2)
+        elif self.loss_type == 'edge+lpips&lpips':
+            edge_lpips = self.lpips_loss(self.get_grads(self.target_image)[0], self.get_grads(image)[0])
+            lpips_loss = self.lpips_loss(self.target_image, image)
+            loss = edge_lpips + lpips_loss
         else:
             assert False, "Invalid loss type"
 
@@ -81,6 +85,8 @@ class LatentOptim:
         loss.backward()
         self.optim.step()
         #self.scheduler.step()
+
+        return loss.item()
 
 def biggest_rectangle(r):
     #return w*h
@@ -157,7 +163,7 @@ if __name__ == '__main__':
     generator.eval()
 
 
-    target_image = img2tensor('face_cropped.jpg')  # Load target image (precropped 64x64)
+    target_image = img2tensor('billie_eilish_cropped.jpg')  # Load target image (precropped 64x64)
     #target_image = cropFace('dimakis-alex.jpg')
     print(target_image.shape)
     plt.imshow(tensor2numpy_image(target_image))
@@ -165,9 +171,16 @@ if __name__ == '__main__':
 
     latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='lpips', device=device, target_image=target_image.to(device), logProbWeight=0)
 
+    min_loss = 1000000
+    min_loss_iter = -1
     for i in range(1, 10000):
         print(f"{i}: ", end="")
-        latent_optim.step()
+        loss = latent_optim.step()
+        if loss < min_loss:
+            min_loss = loss
+            min_loss_iter = i
+        elif i - min_loss_iter >= 1000:
+            pass
 
     image = generator(latent_optim.z_vec).cpu().detach()
     plt.imshow(tensor2numpy_image(image))

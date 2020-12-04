@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import torchvision
 import numpy as np
 import math
@@ -9,6 +11,8 @@ from PIL import Image
 from tqdm import tqdm
 import torch.nn as nn
 from bicubic import BicubicDownSample
+
+from dcgan import Generator
 
 def get_transformation(image_size):
     return transforms.Compose(

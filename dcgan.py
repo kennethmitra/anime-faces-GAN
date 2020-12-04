@@ -71,7 +71,7 @@ class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
         self.main = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=num_z, out_channels=ngf * 8, kernel_size=4, stride=1, padding=0, bias=False), # Whats goin on in 1st convTranspose layer?
+            nn.ConvTranspose2d(in_channels=num_z, out_channels=ngf * 8, kernel_size=4, stride=1, padding=0, bias=False),
             nn.BatchNorm2d(ngf * 8),
             nn.ReLU(True),
 

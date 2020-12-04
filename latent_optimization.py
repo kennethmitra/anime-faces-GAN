@@ -19,7 +19,7 @@ class LatentOptim:
         self.z_vec.requires_grad = True
 
         self.params = [self.z_vec]
-        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.999))
+        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.99))
         #self.optim = torch.optim.SGD(self.params, lr=lr, momentum=0.9)
         #self.scheduler = CosineAnnealingWarmRestarts(self.optim, 100, 1)
         #self.scheduler = CyclicLR(self.optim, base_lr=1e-2, max_lr=0.1, step_size_up=500)

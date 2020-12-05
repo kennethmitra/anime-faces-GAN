@@ -22,10 +22,14 @@ class LatentOptim:
         self.z_vec.requires_grad = True
 
         # Affine transformation variables to optimize over
-        self.dy = torch.tensor(0.0).clone().detach()  # Shift image in y direction. (+) -> down, (-) -> up, range [0, 1]
+        self.dy = torch.tensor(0.0).clone().detach()  # Shift image in y direction. (+) -> down, (-) -> up, range [-1, 1]
         self.dy.requires_grad = True
-        self.dx = torch.tensor(0.0).clone().detach()  # Shift image in x direction. (+) -> right, (-) -> left, range [0, 1]
+        self.dx = torch.tensor(0.0).clone().detach()  # Shift image in x direction. (+) -> right, (-) -> left, range [-1, 1]
         self.dx.requires_grad = True
+        self.scale = torch.tensor(0.0).clone().detach()  # Zoom in or out. (+) -> zoom in, (-) -> zoom out, range [-1, 1]
+        self.scale.requires_grad = True
+        self.rot = torch.tensor(0.0).clone().detach()  # Rotate image. (+) -> Clockwise, (-) -> Counterclockwise
+        self.rot.requires_grad = True
         self.shiftLossWeight = shiftLossWeight
 
         # Define optimizer and params to optimize over
@@ -34,6 +38,12 @@ class LatentOptim:
         # Add affine parameters if affine loss is specified
         if "affine" in self.loss_type:
             self.params.extend([self.dx, self.dy])
+
+            if "scale" in self.loss_type:
+                self.params.extend([self.scale])
+
+            if "rot" in self.loss_type:
+                self.params.extend([self.rot])
 
         self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.99))
         #self.optim = torch.optim.SGD(self.params, lr=lr, momentum=0.9)
@@ -92,7 +102,7 @@ class LatentOptim:
             loss = edge_lpips + lpips_loss
         elif self.loss_type == 'affine_debug':
             loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2)  # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
-        elif self.loss_type == 'affine_lpips':
+        elif self.loss_type == 'affine(trans)_lpips':
             theta = torch.zeros(1, 2, 3)
             theta[:, 0, 0] = 1
             theta[:, 0, 1] = 0
@@ -107,10 +117,46 @@ class LatentOptim:
             lpips_loss = self.lpips_loss(affined_target, image)
             shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2)  # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
             loss = lpips_loss + self.shiftLossWeight * shift_loss
+        elif self.loss_type == 'affine(trans/scale)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1 + (-self.scale * 2)
+            theta[:, 0, 1] = 0
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = 0
+            theta[:, 1, 1] = 1 + (-self.scale * 2)
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
+
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image + 1) / 2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
+
+            # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + torch.pow(self.scale, 2)
+
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
+        elif self.loss_type == 'affine(trans/scale/rot)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1 + (-self.scale * 2)
+            theta[:, 0, 1] = self.rot * 2
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = -self.rot * 2
+            theta[:, 1, 1] = 1 + (-self.scale * 2)
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
+
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image + 1) / 2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
+
+            # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + torch.pow(self.scale, 2) + torch.pow(self.rot, 2)
+
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
         else:
             assert False, "Invalid loss type"
 
-        print(f"Loss: {loss}, dx: {self.dx}, dy: {self.dy}")
+        print(f"Loss: {loss}, dx: {self.dx}, dy: {self.dy}, scale: {self.scale}")
 
         loss.backward()
         self.optim.step()
@@ -156,8 +202,7 @@ def cropFace(image_path, crop_size=(256, 256), resize_dims=(64, 64)):
 
     resized_image = Image.fromarray(resized_image).resize(resize_dims)
 
-    image_tensor = torch.from_numpy(np.array(resized_image)).permute(2, 0, 1).unsqueeze(
-        0).float() / 255.0  # Rescale to [0, 1]
+    image_tensor = torch.from_numpy(np.array(resized_image)).permute(2, 0, 1).unsqueeze(0).float() / 255.0  # Rescale to [0, 1]
     image_tensor = (image_tensor - 0.5) / 0.5  # Rescale [0, 1] to [-1, 1]
     return image_tensor
 
@@ -199,7 +244,7 @@ if __name__ == '__main__':
     plt.imshow(tensor2numpy_image(target_image))
     plt.show()
 
-    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='affine_lpips', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=1e-6)
+    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='affine(trans/scale/rot)_lpips', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=1e-2)
 
     # Early Stopping Config
     early_stopping = False

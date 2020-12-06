@@ -1,104 +1,79 @@
-from collections import OrderedDict
-
-import torchvision
-import numpy as np
-import math
+import cv2
 import torch
-from torch import optim
-from torch.nn import functional as F
-from torchvision import transforms
+import math
 from PIL import Image
-from tqdm import tqdm
-import torch.nn as nn
-from bicubic import BicubicDownSample
-
-from dcgan import Generator
-
-def get_transformation(image_size):
-    return transforms.Compose(
-        [transforms.Resize(image_size),
-         transforms.ToTensor(),
-         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
-
-class LatentOptimizer(torch.nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        if config['image_size'][0] != config['image_size'][1]:
-            raise Exception('Non-square images are not supported yet.')
-
-        self.reconstruction = 'invert'
-        #self.project = config["project"]
-        self.steps = 1000
-
-        self.layer_in = None
-        self.best = None
-        self.skip = None
-        self.lr = 0.1
-        self.lr_record = []
-        self.current_step = 0
-
-        # prepare images
-        device = 'cuda'
-        resized_imgs = []
-        original_imgs = []
-
-        transform_lpips = get_transformation(256)
-        transform = get_transformation(256)
-
-        for imgfile in '/content/dcgan/alex.png':
-            resized_imgs.append(transform_lpips(Image.open(imgfile).convert("RGB")))
-            original_imgs.append(transform(Image.open(imgfile).convert("RGB")))
-
-        self.resized_imgs = torch.stack(resized_imgs, 0).to(device)
-        self.original_imgs = torch.stack(original_imgs, 0).to(device)
-
-        self.downsampler_1024_image = BicubicDownSample(4)
-
-        # Load models and pre-trained weights
-        gen = Generator(1024, 512, 8)
-        gen.load_state_dict(torch.load(config["ckpt"])["g_ema"], strict=False)
-        gen.eval()
-        self.gen = gen.to(device)
-        self.gen.start_layer = 0
-        self.gen.end_layer = 4
+import numpy as np
+from torchvision import transforms
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CyclicLR
+import torch.nn.functional as F
+import lpips
+from pytorch_msssim import ms_ssim
+from tqdm import tqdm_notebook
 
 
-        self.mpl = MappingProxy(torch.load('gaussian_fit.pt'))
-        self.percept = lpips.PerceptualLoss(model="net-lin", net="vgg",
-                                            use_gpu=device.startswith("cuda"))
+class LatentOptim:
+    def __init__(self, generator, z_size, lr, device, target_image, logProbWeight=0.0, shiftLossWeight=1.0, loss_type="default"):
+        self.logProbWeight = logProbWeight
+        self.loss_type = loss_type
+        self.generator = generator
+        self.z_size = z_size
+        self.z_pdf = torch.distributions.Normal(0, 1)
+        self.lr = lr
+        # Latent Vector to optimize over
+        self.z_vec = torch.randn(1, z_size, 1, 1, device=device).clone().detach()
+        self.z_vec.requires_grad = True
 
+        # Affine transformation variables to optimize over
+        self.dy = torch.tensor(0.0).clone().detach()  # Shift image in y direction. (+) -> down, (-) -> up, range [-1, 1]
+        self.dy.requires_grad = True
+        self.dx = torch.tensor(0.0).clone().detach()  # Shift image in x direction. (+) -> right, (-) -> left, range [-1, 1]
+        self.dx.requires_grad = True
+        self.scale = torch.tensor(0.0).clone().detach()  # Zoom in or out. (+) -> zoom in, (-) -> zoom out, range [-1, 1]
+        self.scale.requires_grad = True
+        self.rot = torch.tensor(0.0).clone().detach()  # Rotate image. (+) -> Clockwise, (-) -> Counterclockwise
+        self.rot.requires_grad = True
+        self.shiftLossWeight = shiftLossWeight
 
-        self.cls = imagenet_models.resnet50()
-        state_dict = torch.load('imagenet_l2_3_0.pt')['model']
-        new_dict = OrderedDict()
+        # Define optimizer and params to optimize over
+        self.params = [self.z_vec]
 
-        for key in state_dict.keys():
-            if 'module.model' in key:
-                new_dict[key[13:]] = state_dict[key]
+        # Add affine parameters if affine loss is specified
+        if "affine" in self.loss_type:
+            self.params.extend([self.dx, self.dy])
 
-        self.cls.load_state_dict(new_dict)
-        self.cls.to(config['device'])
+            if "scale" in self.loss_type:
+                self.params.extend([self.scale])
 
-        bs = self.original_imgs.shape[0]
+            if "rot" in self.loss_type:
+                self.params.extend([self.rot])
 
-        # initialization
-        if self.gen.start_layer == 0:
-            noises_single = self.gen.make_noise(bs)
-            self.noises = []
-            for noise in noises_single:
-                self.noises.append(noise.normal_())
-            self.latent_z = torch.randn(
-                        (bs, 18, 512),
-                        dtype=torch.float,
-                        requires_grad=True, device='cuda')
-            self.gen_outs = [None]
-        else:
-            # restore noises
-            self.noises = torch.load(config['saved_noises'][0])
-            self.latent_z = torch.load(config['saved_noises'][1]).to(config['device'])
-            self.gen_outs = torch.load(config['saved_noises'][2])
-            self.latent_z.requires_grad = True
+        self.optim = torch.optim.Adam(self.params, lr=lr, betas=(0.9, 0.99))
+        #self.optim = torch.optim.SGD(self.params, lr=lr, momentum=0.9)
+        #self.scheduler = CosineAnnealingWarmRestarts(self.optim, 100, 1)
+        #self.scheduler = CyclicLR(self.optim, base_lr=1e-2, max_lr=0.1, step_size_up=500)
+        self.target_image = target_image
+
+        # Gradient Convolution Kernels
+        self.kernel_x = torch.FloatTensor([[-1, 0, 1],
+                                       [-1, 0, 1],
+                                       [-1, 0, 1]]).unsqueeze(0).unsqueeze(0).to(device)
+        self.kernel_y = torch.FloatTensor([[-1, -1, -1],
+                                       [0, 0, 0],
+                                       [1, 1, 1]]).unsqueeze(0).unsqueeze(0).to(device)
+        self.lapacian_operator = torch.FloatTensor([[0, 1, 0],
+                                                [1, -4, 1],
+                                                [0, 1, 0]]).unsqueeze(0).unsqueeze(0).to(device)
+
+        if 'lpips' in self.loss_type or 'mssim' in self.loss_type:
+            self.lpips_loss = lpips.LPIPS(net='vgg').to(device)
+            #self.lpips_loss = lpips_pytorch.LPIPS(net_type='vgg')
+        #apply mask if trying to retrieve
+        if 'retrieve' in self.loss_type:
+            mask = torch.ones((64,64), device=device)
+            _, _, x, y = torch.where(self.target_image == -1)
+            mask[x, y] = 0
+            image = image * mask
 
     def get_lr(self, t, initial_lr, rampdown=0.75, rampup=0.05):
         lr_ramp = min(1, (1 - t) / rampdown)
@@ -106,130 +81,228 @@ class LatentOptimizer(torch.nn.Module):
         lr_ramp = lr_ramp * min(1, t / rampup)
         return initial_lr * lr_ramp
 
+    def get_grads(self, image):
+        # Convert to grayscale if not already
+        if image.shape[1] > 1:
+            image = torch.mean(image, dim=1, keepdim=True)
 
-    def invert_(self, start_layer, noise_list, steps, verbose=False, project=False):
-        # noise_list containts the indices of nodes that we will be optimizing over
-        for i in range(len(self.noises)):
-            if i in noise_list:
-                self.noises[i].requires_grad = True
-            else:
-                self.noises[i].requires_grad = False
+        grad_x = F.conv2d(image, self.kernel_x)
+        grad_y = F.conv2d(image, self.kernel_y)
+        grad_mag = (grad_x ** 2 + grad_y ** 2) ** 0.5
+        laplacian = F.conv2d(image, self.lapacian_operator)
+        return grad_mag, laplacian
 
-        with torch.no_grad():
-            if start_layer == 0:
-                var_list = [self.latent_z] + self.noises
-            else:
-                intermediate_out = torch.ones(self.gen_outs[-1].shape, device=self.gen_outs[-1].device) * self.gen_outs[-1]
-                intermediate_out.requires_grad = True
-                var_list = [self.latent_z] + self.noises + [self.gen_outs[-1]]
+    def step(self,t):
+        #self.lr = self.get_lr(t,self.lr)
+        self.optim.zero_grad()
 
-            # set network that we will be optimizing over
-            self.gen.start_layer = start_layer
-            self.gen.end_layer = 4
+        # Compute Loss
+        image = self.generator(self.z_vec)
 
-        optimizer = optim.Adam(var_list, lr=self.lr)
-        #ps = SphericalOptimizer([self.latent_z] + self.noises)
-        pbar = tqdm(range(steps))
-        self.current_step += steps
+        # Step optimizer
+        
 
-        if self.reconstruction == 'inpaint':
-            mask = torch.ones(self.config['image_size'], device=self.config['device'])
-            _, _, x, y = torch.where(self.original_imgs == -1)
-            mask[x, y] = 0
+        if self.loss_type == 'mse' or self.loss_type == 'default':
+            logProb = self.z_pdf.log_prob(self.z_vec).mean()  # From https://github.com/ToniCreswell/InvertingGAN/blob/master/scripts/invert.py
+            loss = torch.mean((self.target_image - image)**2) - self.logProbWeight * logProb
+        elif self.loss_type == 'ssim-lpips':
+            ssim_loss = SSIM(window_size = 11)
+            s_loss = ssim_loss(self.target_image,image)
+            l_loss = self.lpips_loss(self.target_image,image)
+            loss = 0.3*s_loss + l_loss + 0.2 * torch.mean((self.target_image - image)**2)
+            #loss += 0.05*loss_geocross(self.z_vec)
+        elif self.loss_type == 'mssim':
+            X = (self.target_image + 1)/2
+            Y = (image +1)/2    #denormalize
+            #print(min(X.shape[-2:]))
+            msssim_loss = 1 - ms_ssim(X, Y,data_range=1,win_size=3, size_average=False )
+            mse = torch.mean((self.target_image - image)**2)
+            #lpips = self.lpips_loss(self.target_image, image)
+            loss = msssim_loss + 0.1*mse
+        elif self.loss_type == 'edge+mse':
+            loss = torch.mean((self.get_grads(self.target_image)[0] - self.get_grads(image)[0]) ** 2)
+        elif self.loss_type == 'edge+lpips':
+            loss = self.lpips_loss(self.get_grads(self.target_image)[0], self.get_grads(image)[0])
+        elif self.loss_type == 'lpips':
+            loss = self.lpips_loss(self.target_image, image)
+        elif self.loss_type == 'lpips+mse':
+            loss = 0.8 * self.lpips_loss(self.target_image, image) + 0.2 * torch.mean((self.target_image - image)**2)
+        elif self.loss_type == 'edge+lpips&lpips':
+            edge_lpips = self.lpips_loss(self.get_grads(self.target_image)[0], self.get_grads(image)[0])
+            lpips_loss = self.lpips_loss(self.target_image, image)
+            loss = edge_lpips + lpips_loss
+        elif self.loss_type == 'affine_debug':
+            loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2)  # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+        elif self.loss_type == 'affine(trans)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1
+            theta[:, 0, 1] = 0
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = 0
+            theta[:, 1, 1] = 1
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
 
-        mse_min = np.inf
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image+1)/2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2)  # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
+        elif self.loss_type == 'affine(trans/scale)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1 + (-self.scale * 2)
+            theta[:, 0, 1] = 0
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = 0
+            theta[:, 1, 1] = 1 + (-self.scale * 2)
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
 
-        lr_func = lambda x: (9*(1-np.abs(x/(0.9*steps)-1/2)*2)+1)/10 if x < 0.9*steps else 1/10 + (x-0.9*steps)/(0.1*steps)*(1/1000-1/10)
-        for i in pbar:
-            t = i / steps
-            lr = self.get_lr(t, self.lr)
-            optimizer.param_groups[0]["lr"] = lr
-            self.lr_record.append(lr)
-            latent_w = self.mpl(self.latent_z)
-            img_gen, _ = self.gen([latent_w], 
-                                  input_is_latent=True,
-                                  noise=self.noises, 
-                                  layer_in=self.gen_outs[-1],)
-            batch, channel, height, width = img_gen.shape
-            factor = height // 256
-            # calculate loss
-            if self.reconstruction == 'inpaint':
-                # downsample generared images
-                downsampled = self.downsampler_1024_image(img_gen)
-                # mask
-                masked = downsampled * mask
-                # compute loss
-                diff = torch.abs(masked - self.original_imgs) - self.config['dead_zone_linear_alpha']
-                dead_zone_linear_loss = torch.max(torch.zeros(diff.shape, device=diff.device), diff).sum()
-                mse_loss = F.mse_loss(masked, self.original_imgs)
-                if self.config['lpips_method'] == 'mask':
-                    p_loss = self.percept(self.downsampler_image_256(masked),
-                                          self.downsampler_image_256(self.original_imgs)).sum()
-                elif self.config['lpips_method'] == 'fill':
-                    filled = mask * self.original_imgs + (1 - mask) * downsampled
-                    p_loss = self.percept(self.downsampler_1024_256(img_gen), self.downsampler_image_256(filled)).sum()
-                else:
-                    raise NotImplementdError('LPIPS policy not implemented')
-            elif self.reconstruction == 'invert':
-                diff = torch.abs(self.downsampler_1024_image(img_gen) - self.original_imgs) - self.config['dead_zone_linear_alpha']
-                dead_zone_linear_loss = torch.max(torch.zeros(diff.shape, device=diff.device), diff).sum()
-                mse_loss = F.mse_loss(self.downsampler_1024_image(img_gen), self.original_imgs)
-                p_loss = self.percept(self.downsampler_1024_256(img_gen), self.resized_imgs).sum()
-            elif self.reconstruction == 'denoise':
-                diff = torch.abs(self.downsampler_1024_image(img_gen) - self.original_imgs) - self.config['dead_zone_linear_alpha']
-                dead_zone_linear_loss = torch.max(torch.zeros(diff.shape, device=diff.device), diff).sum()
-                mse_loss = F.mse_loss(self.downsampler_1024_image(img_gen), self.original_imgs)
-                p_loss = self.percept(self.downsampler_1024_256(img_gen), self.resized_imgs).sum()
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image + 1) / 2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
 
-            loss = p_loss + mse_loss
-            # if self.config['cls']:
-            #     downsampled = self.downsampler_1024_128(img_gen)
-            #     cls_out = self.cls(downsampled)
-            #     cls_loss = F.cross_entropy(cls_out, self.config['target'] * torch.ones(cls_out.shape[0], device=img_gen.device, dtype=torch.int64))
-            #     loss += self.config['cls'] * cls_loss
-            #     cls_prob = F.softmax(cls_out, dim=-1)[0, self.config['target']].item()
-            # else:
-            #     cls_prob = 0.0
+            # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + torch.pow(self.scale, 2)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
+        elif self.loss_type == 'affine(trans/scale/rot)_lpips':
+            theta = torch.zeros(1, 2, 3)
+            theta[:, 0, 0] = 1 + (-self.scale * 2)
+            theta[:, 0, 1] = self.rot * 2
+            theta[:, 0, 2] = -self.dx * 2
+            theta[:, 1, 0] = -self.rot * 2
+            theta[:, 1, 1] = 1 + (-self.scale * 2)
+            theta[:, 1, 2] = -self.dy * 2
+            theta = theta.to(device)
 
-            # if self.project:
-            #     ps.step()
+            grid = F.affine_grid(theta, image.shape, align_corners=False)
+            affined_target = F.grid_sample((-self.target_image + 1) / 2, grid, align_corners=False) * -2 + 1
+            lpips_loss = self.lpips_loss(affined_target, image)
 
-            if mse_loss < mse_min:
-                mse_min = mse_loss
-                self.best = img_gen.detach().cpu()
-            pbar.set_description(
-                (
-                    f"perceptual: {p_loss.item():.4f}; noise regularize: {0:.4f};"
-                    f" mse: {mse_loss.item():.4f};"
-                    #f" cls_prob: {cls_prob:.4f} lr: {lr:.4f}"
-                )
-            )
-            if False and i % 50 == 0:
-                torchvision.utils.save_image(
-                    img_gen,
-                    f'gif_{start_layer}_{i}.png',
-                    nrow=int(img_gen.shape[0] ** 0.5),
-                    normalize=True)
-        # TODO: check what happens when we are in the last layer
-        with torch.no_grad():
-            latent_w = self.mpl(self.latent_z)
-            self.gen.end_layer = self.gen.start_layer
-            intermediate_out, _  = self.gen([latent_w],
-                                             input_is_latent=True,
-                                             noise=self.noises,
-                                             layer_in=self.gen_outs[-1],
-                                             skip=self.skip)
-            self.gen_outs.append(intermediate_out)
-            self.gen.end_layer = self.config['end_layer']
+            # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
+            shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + torch.pow(self.scale, 2) + torch.pow(self.rot, 2)
 
-    def invert(self):
-        for i, steps in enumerate(self.steps.split(',')):
-            begin_from = i + self.config['start_layer']
-            if begin_from > self.config['end_layer']:
-                raise Exception('Attempting to go after end layer...')
-            self.invert_(begin_from, range(5 + 2 * begin_from), int(steps))
-        return (self.latent_z, self.noises, self.gen_outs), self.best
+            loss = lpips_loss + self.shiftLossWeight * shift_loss
+        else:
+            assert False, "Invalid loss type"
+        loss.backward()
+        self.optim.step()
+        #self.scheduler.step()
+        return loss.item(), self.z_vec.detach()
+
+def biggest_rectangle(r):
+    #return w*h
+    return r[2]*r[3]
+
+def cropFace(image_path, crop_size=(256, 256), resize_dims=(64, 64)):
+    """
+    Load an image from file, detect face, crop to square bounding box, and return torch tensor in (N, C, H, W) order
+    :param image_path: path to image on disk
+    :param crop_size: dimensions of returned image
+    :return: torch tensor
+    """
+    image = cv2.imread(image_path)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    # detector options
+    anime_face_cascade = cv2.CascadeClassifier('./lbpcascade_animeface.xml')
+    human_face_cascade = cv2.CascadeClassifier('./haarcascade_frontalface_default.xml')
+    faces = anime_face_cascade.detectMultiScale(gray, scaleFactor=1.01, minNeighbors=5, minSize=(90, 90))
+    faces2 = human_face_cascade.detectMultiScale(gray)
+
+    faces = [x for x in faces]
+    faces2 = [x for x in faces2]
+    faces.extend(faces2)
+
+    # if any faces are detected, we only extract the biggest detected region
+    if len(faces) == 0:
+        assert False, "No face detected in image"
+    elif len(faces) > 1:
+        sorted(faces, key=biggest_rectangle, reverse=True)
+
+    x, y, w, h = faces[0]
+    cropped_image = image[y:y + h, x:x + w, :]
+    resized_image = cv2.resize(cropped_image, crop_size)
+
+    resized_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
+
+    resized_image = Image.fromarray(resized_image).resize(resize_dims)
+
+    image_tensor = torch.from_numpy(np.array(resized_image)).permute(2, 0, 1).unsqueeze(0).float() / 255.0  # Rescale to [0, 1]
+    image_tensor = (image_tensor - 0.5) / 0.5  # Rescale [0, 1] to [-1, 1]
+    return image_tensor
+
+def img2tensor(image_path, resize_dims=(64, 64)):
+    """
+    Read image from disk, return pytorch tensor (N, C, H, W)
+    :param image_path: path to image on disk
+    :return: numpy array
+    """
+    target_image = Image.open(image_path).convert("RGB")
+    target_image = target_image.resize(resize_dims)
+    target_image = torch.from_numpy(np.array(target_image)).permute(2, 0, 1).unsqueeze(0).float() / 255.0  # Rescale to [0, 1]
+    target_image = (target_image - 0.5) / 0.5  # Rescale [0, 1] to [-1, 1]
+    return target_image
+
+def tensor2numpy_image(image_tensor):
+    """
+    Convert a tensor (N, C, H, W) to a numpy array (H, W, C) [for plotting with plt.imshow()]
+    :param image_tensor: input image in tensor form
+    :return: numpy array
+    """
+    return np.array(image_tensor.squeeze(0).permute(1, 2, 0) * 0.5 + 0.5)
+
+if __name__ == '__main__':
+    # Get GPU 
+    import math
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f'Device: {device}')
+
+    # Set up Generator
+    generator = Generator().to(device)
+    save = torch.load('/content/latent_optim/iter48800.save')
+    generator.load_state_dict(save['gen_params'])
+    generator.eval()
+
+
+    target_image = img2tensor('/content/tanjiro.png')  # Load target image (precropped 64x64)
+    #target_image = cropFace('dimakis-alex.jpg')
+    print(target_image.shape)
+    plt.imshow(tensor2numpy_image(target_image))
+    plt.show()
+
+    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='mssim', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=1e-2)
+
+    # Early Stopping Config
+    early_stopping = False
+    min_loss = 1000000
+    min_loss_iter = -1
+    best_zvec = None
+
+    print(latent_optim.dx)
+    print(latent_optim.dy)
+    # Run optimization
+    steps = 10000
+    pbar = tqdm_notebook(range(steps))
+    for i in pbar:
+        t = i / steps
+        loss, z_vec = latent_optim.step(t)
+        if loss < min_loss:
+            min_loss = loss
+            min_loss_iter = i
+            best_zvec = z_vec
+
+        elif i - min_loss_iter >= 1000 and early_stopping:
+            break
+
+    image = generator(latent_optim.z_vec).cpu().detach()
+    plt.imshow(tensor2numpy_image(image))
+    plt.title(f"Last z_vec, loss{loss}")
+    plt.show()
+
+    image = generator(best_zvec).cpu().detach()
+    plt.imshow(tensor2numpy_image(image))
+    plt.title(f"Best Z_vec, loss={min_loss}, iter={min_loss_iter}")
+    plt.show()
+    print(torch.min(image), torch.max(image))

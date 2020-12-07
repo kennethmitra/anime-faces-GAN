@@ -1,3 +1,4 @@
+#@title Optimizer
 import cv2
 import torch
 import math
@@ -65,15 +66,10 @@ class LatentOptim:
                                                 [1, -4, 1],
                                                 [0, 1, 0]]).unsqueeze(0).unsqueeze(0).to(device)
 
-        if 'lpips' in self.loss_type or 'mssim' in self.loss_type:
+        if 'lpips' in self.loss_type or 'msssim' in self.loss_type or 'retrieve' in self.loss_type:
             self.lpips_loss = lpips.LPIPS(net='vgg').to(device)
             #self.lpips_loss = lpips_pytorch.LPIPS(net_type='vgg')
         #apply mask if trying to retrieve
-        if 'retrieve' in self.loss_type:
-            mask = torch.ones((64,64), device=device)
-            _, _, x, y = torch.where(self.target_image == -1)
-            mask[x, y] = 0
-            image = image * mask
 
     def get_lr(self, t, initial_lr, rampdown=0.75, rampup=0.05):
         lr_ramp = min(1, (1 - t) / rampdown)
@@ -100,9 +96,19 @@ class LatentOptim:
         image = self.generator(self.z_vec)
 
         # Step optimizer
-        
-
-        if self.loss_type == 'mse' or self.loss_type == 'default':
+        if 'retrieve' in self.loss_type:
+            mask = torch.ones((64,64), device=device)
+            _, _, x, y = torch.where(self.target_image == -1)
+            mask[x, y] = 0
+            X = (self.target_image + 1)/2
+            Y = (image +1)/2    #denormalize
+            Y = Y * mask
+            #print(min(X.shape[-2:]))
+            l_loss = self.lpips_loss(X,Y)
+            msssim_loss = 1 - ms_ssim(X, Y,data_range=1,win_size=3, size_average=False )
+            #mse = torch.mean((self.target_image - image)**2)
+            loss = msssim_loss + 0.5 * l_loss
+        elif self.loss_type == 'mse' or self.loss_type == 'default':
             logProb = self.z_pdf.log_prob(self.z_vec).mean()  # From https://github.com/ToniCreswell/InvertingGAN/blob/master/scripts/invert.py
             loss = torch.mean((self.target_image - image)**2) - self.logProbWeight * logProb
         elif self.loss_type == 'ssim-lpips':
@@ -111,14 +117,14 @@ class LatentOptim:
             l_loss = self.lpips_loss(self.target_image,image)
             loss = 0.3*s_loss + l_loss + 0.2 * torch.mean((self.target_image - image)**2)
             #loss += 0.05*loss_geocross(self.z_vec)
-        elif self.loss_type == 'mssim':
+        elif self.loss_type == 'msssim':
             X = (self.target_image + 1)/2
             Y = (image +1)/2    #denormalize
             #print(min(X.shape[-2:]))
             msssim_loss = 1 - ms_ssim(X, Y,data_range=1,win_size=3, size_average=False )
             mse = torch.mean((self.target_image - image)**2)
-            #lpips = self.lpips_loss(self.target_image, image)
-            loss = msssim_loss + 0.1*mse
+            lpips = self.lpips_loss(self.target_image, image)
+            loss = msssim_loss + 0.5*lpips
         elif self.loss_type == 'edge+mse':
             loss = torch.mean((self.get_grads(self.target_image)[0] - self.get_grads(image)[0]) ** 2)
         elif self.loss_type == 'edge+lpips':
@@ -253,7 +259,7 @@ def tensor2numpy_image(image_tensor):
     """
     return np.array(image_tensor.squeeze(0).permute(1, 2, 0) * 0.5 + 0.5)
 
-if __name__ == '__main__':
+if __name__ == '__mian__':
     # Get GPU 
     import math
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -266,13 +272,13 @@ if __name__ == '__main__':
     generator.eval()
 
 
-    target_image = img2tensor('/content/tanjiro.png')  # Load target image (precropped 64x64)
+    target_image = img2tensor('/content/dimakis censored.png')  # Load target image (precropped 64x64)
     #target_image = cropFace('dimakis-alex.jpg')
     print(target_image.shape)
     plt.imshow(tensor2numpy_image(target_image))
     plt.show()
 
-    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='mssim', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=1e-2)
+    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='retrieve', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=1e-2)
 
     # Early Stopping Config
     early_stopping = False

@@ -34,11 +34,11 @@ class SuperResDataset(Dataset):
 class SuperResModel(nn.Module):
 
     def __init__(self):
-        super(EnhancerModel, self).__init__()
+        super(SuperResModel, self).__init__()
 
         number_f = 32
         self.subpixel_convolutional_block = SubPixelConvolutionalBlock(kernel_size=3, n_channels=3, scaling_factor=2)
-        self.upsample = nn.Upsample(scale_factor=2, mode='bicubic')
+        self.upsample = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=False)
         self.conv1 = nn.Conv2d(in_channels=3,            out_channels=number_f,   kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1   = nn.BatchNorm2d(number_f)
         self.conv2 = nn.Conv2d(in_channels=number_f,     out_channels=number_f,   kernel_size=3, stride=1, padding=1, bias=False)
@@ -47,9 +47,10 @@ class SuperResModel(nn.Module):
         self.bn3   = nn.BatchNorm2d(number_f*2)
         self.conv4 = nn.Conv2d(in_channels=number_f*2,   out_channels=number_f*2, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn4   = nn.BatchNorm2d(number_f*2)
-        self.conv5 = nn.Conv2d(in_channels=number_f * 2, out_channels=number_f*4, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv5 = nn.Conv2d(in_channels=number_f*2 , out_channels=number_f*4, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn5   = nn.BatchNorm2d(number_f*4)
-        self.conv6 = nn.Conv2d(in_channels=number_f * 4, out_channels=3,          kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv6 = nn.Conv2d(in_channels=number_f*4 , out_channels=3,          kernel_size=3, stride=1, padding=1, bias=False)
+        self.tanh =  nn.Tanh()
         
     def forward(self, X):
         bicubic_upsample = self.upsample(X)
@@ -70,9 +71,9 @@ class SuperResModel(nn.Module):
         x2 = F.relu(self.conv5(x2))
         x2 = self.bn5(x2)
 
-        x2 = F.tanh(self.conv6(x2))
+        x2 = self.conv6(x2)
 
-        x3 = x2 + bicubic_upsample
+        x3 = self.tanh(x2 + bicubic_upsample)
         return x3
 
 class SubPixelConvolutionalBlock(nn.Module):

@@ -164,15 +164,15 @@ class LatentOptim:
             # Must use torch.pow(x, 2) instead of x**2 for autograd (idk why but x**2 doesn't work as well)
             #shift_loss = torch.pow(self.dx, 2) + torch.pow(self.dy, 2) + 8*torch.pow(self.scale, 2) \
             #             + 2*torch.pow(self.rot, 2) + self.lpips_loss(self.target_image, affined_target)#(torch.mean(torch.pow(self.target_image - affined_target, 2)))
-            shift_loss = self.lpips_loss(self.target_image, affined_target)
+            shift_loss = self.lpips_loss(self.target_image, affined_target) + torch.pow(self.scale, 2) + torch.pow(self.rot, 2)
             mse = torch.mean(torch.pow(self.target_image - affined_target, 2))
             loss = lpips_loss + self.shiftLossWeight * shift_loss #+ 1e-3 * mse
 
         else:
             assert False, "Invalid loss type"
 
-        print(f"Loss: {loss}, dx: {self.dx:0.5f}, dy: {self.dy:0.5f}, scale: {self.scale:0.5f}, rot: {self.rot:0.5f},")
-              #f"shift_loss: {self.shiftLossWeight * shift_loss}, lpips: {lpips_loss}")
+        print(f"Loss: {loss}, dx: {self.dx:0.5f}, dy: {self.dy:0.5f}, scale: {self.scale:0.5f}, rot: {self.rot:0.5f},",
+              f"shift_loss: {self.shiftLossWeight * shift_loss}, lpips: {lpips_loss}")
 
         loss.backward()
         self.optim.step()
@@ -260,7 +260,7 @@ if __name__ == '__main__':
     plt.imshow(tensor2numpy_image(target_image))
     plt.show()
 
-    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='lpips', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=0.75)
+    latent_optim = LatentOptim(generator=generator, z_size=100, lr=0.1,  loss_type='affine(trans/scale/rot)_lpips', device=device, target_image=target_image.to(device), logProbWeight=0, shiftLossWeight=0.25)
 
     # Early Stopping Config
     early_stopping = False

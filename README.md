@@ -97,7 +97,7 @@ As you can see, the LPIPS and MSE loss metrics performed the best. Out of the ed
 ## Inverting Anime Faces
 The next step was to invert an anime face that the GAN had never seen in training. We once again compared the performance of several loss functions.
 
-![Target Anime Face](/readme_images/invertin_anime_target.png "Target Anime Face")
+![Target Anime Face](/readme_images/inverting_anime_target.png "Target Anime Face")
 
 _Target Anime Face_
 
@@ -211,7 +211,7 @@ _Human Face Target Image_
 
 _Result with masked MS-SSIM Loss_
   
-![Result](/readme_images/completion_human_LPIPS.png "Result with LPIPS")
+![Result](/readme_images/completion_human_lpips.png "Result with LPIPS")
 
 _Result with masked LPIPS Loss_
   
